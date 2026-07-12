@@ -1,0 +1,294 @@
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: kafka
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,PLAINTEXT_HOST://0.0.0.0:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+
+  redis:
+    image: redis:7.2
+    container_name: redis
+    ports:
+      - "6379:6379"
+
+  prometheus:
+    image: prom/prometheus:v2.53.1
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - "./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro"
+      - "./observability/prometheus/rules:/etc/prometheus/rules:ro"
+    depends_on:
+      - api-gateway
+      - auth-service
+      - user-service
+      - order-service
+      - inventory-service
+
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    container_name: alertmanager
+    ports:
+      - "9093:9093"
+    volumes:
+      - "./observability/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro"
+    command:
+      - "--config.file=/etc/alertmanager/alertmanager.yml"
+    depends_on:
+      - prometheus
+
+  loki:
+    image: grafana/loki:3.1.1
+    container_name: loki
+    ports:
+      - "3100:3100"
+    command:
+      - "-config.file=/etc/loki/local-config.yaml"
+
+  promtail:
+    image: grafana/promtail:3.1.1
+    container_name: promtail
+    volumes:
+      - "./observability/promtail/promtail-config.yml:/etc/promtail/config.yml:ro"
+      - "./logs:/workspace-logs"
+    command:
+      - "-config.file=/etc/promtail/config.yml"
+    depends_on:
+      - loki
+
+  grafana:
+    image: grafana/grafana:11.1.0
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - "./observability/grafana/provisioning:/etc/grafana/provisioning:ro"
+      - "./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro"
+    depends_on:
+      - prometheus
+      - loki
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.59
+    container_name: jaeger
+    ports:
+      - "16686:16686"   # UI
+      - "4317:4317"     # OTLP gRPC
+      - "4318:4318"     # OTLP HTTP
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    command:
+      - "--collector.otlp.grpc.host-port=:4317"
+      - "--collector.otlp.http.host-port=:4318"
+
+  mysql-user:
+    image: mysql:8.0
+    container_name: mysql-user
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: userdb
+    ports:
+      - "3307:3306"
+
+  mysql-order:
+    image: mysql:8.0
+    container_name: mysql-order
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: orderdb
+    ports:
+      - "3308:3306"
+
+  mysql-auth:
+    image: mysql:8.0
+    container_name: mysql-auth
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: authdb
+    ports:
+      - "3309:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-proot"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  mongo-inventory:
+    image: mongo:7.0
+    container_name: mongo-inventory
+    ports:
+      - "27017:27017"
+
+  discovery-server:
+    build:
+      context: .
+      dockerfile: discovery-server/Dockerfile
+    container_name: discovery-server
+    ports:
+      - "8761:8761"
+    depends_on:
+      - zookeeper
+
+  config-server:
+    build:
+      context: .
+      dockerfile: config-server/Dockerfile
+    container_name: config-server
+    ports:
+      - "8888:8888"
+    depends_on:
+      - discovery-server
+    environment:
+      EUREKA_SERVER_URL: http://discovery-server:8761/eureka/
+
+  api-gateway:
+    build:
+      context: .
+      dockerfile: api-gateway/Dockerfile
+    container_name: api-gateway
+    ports:
+      - "8080:8080"
+    depends_on:
+      - discovery-server
+      - config-server
+      - redis
+    environment:
+      EUREKA_SERVER_URL: http://discovery-server:8761/eureka/
+      CONFIG_SERVER_URL: http://config-server:8888
+      JWT_SECRET: TXlTdXBlclNlY3JldEtleUZvckp3dFNpZ25pbmdNeVN1cGVyU2VjcmV0S2V5MTIzNDU2Nzg5MDE=
+      GATEWAY_SECRET: dev-gateway-secret
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      OTLP_TRACING_ENDPOINT: http://jaeger:4318/v1/traces
+      LOGGING_FILE_NAME: /logs/api-gateway.log
+    volumes:
+      - "./logs:/logs"
+
+  auth-service:
+    build:
+      context: .
+      dockerfile: auth-service/Dockerfile
+    container_name: auth-service
+    ports:
+      - "8084:8084"
+    depends_on:
+      mysql-auth:
+        condition: service_healthy
+      discovery-server:
+        condition: service_started
+      config-server:
+        condition: service_started
+    environment:
+      AUTH_DB_HOST: mysql-auth
+      AUTH_DB_PORT: 3306
+      AUTH_DB_USERNAME: root
+      AUTH_DB_PASSWORD: root
+      EUREKA_SERVER_URL: http://discovery-server:8761/eureka/
+      CONFIG_SERVER_URL: http://config-server:8888
+      JWT_SECRET: TXlTdXBlclNlY3JldEtleUZvckp3dFNpZ25pbmdNeVN1cGVyU2VjcmV0S2V5MTIzNDU2Nzg5MDE=
+      GATEWAY_SECRET: dev-gateway-secret
+      OTLP_TRACING_ENDPOINT: http://jaeger:4318/v1/traces
+      LOGGING_FILE_NAME: /logs/auth-service.log
+    volumes:
+      - "./logs:/logs"
+
+  user-service:
+    build:
+      context: .
+      dockerfile: user-service/Dockerfile
+    container_name: user-service
+    ports:
+      - "8081:8081"
+    depends_on:
+      - mysql-user
+      - discovery-server
+      - config-server
+    environment:
+      USER_DB_HOST: mysql-user
+      USER_DB_PORT: 3306
+      USER_DB_USERNAME: root
+      USER_DB_PASSWORD: root
+      EUREKA_SERVER_URL: http://discovery-server:8761/eureka/
+      CONFIG_SERVER_URL: http://config-server:8888
+      GATEWAY_SECRET: dev-gateway-secret
+      OTLP_TRACING_ENDPOINT: http://jaeger:4318/v1/traces
+      LOGGING_FILE_NAME: /logs/user-service.log
+    volumes:
+      - "./logs:/logs"
+
+  order-service:
+    build:
+      context: .
+      dockerfile: order-service/Dockerfile
+    container_name: order-service
+    ports:
+      - "8082:8082"
+    depends_on:
+      - mysql-order
+      - kafka
+      - discovery-server
+      - config-server
+    environment:
+      ORDER_DB_HOST: mysql-order
+      ORDER_DB_PORT: 3306
+      ORDER_DB_USERNAME: root
+      ORDER_DB_PASSWORD: root
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      EUREKA_SERVER_URL: http://discovery-server:8761/eureka/
+      CONFIG_SERVER_URL: http://config-server:8888
+      GATEWAY_SECRET: dev-gateway-secret
+      OTLP_TRACING_ENDPOINT: http://jaeger:4318/v1/traces
+      LOGGING_FILE_NAME: /logs/order-service.log
+    volumes:
+      - "./logs:/logs"
+
+  inventory-service:
+    build:
+      context: .
+      dockerfile: inventory-service/Dockerfile
+    container_name: inventory-service
+    ports:
+      - "8083:8083"
+    depends_on:
+      - mongo-inventory
+      - kafka
+      - discovery-server
+      - config-server
+    environment:
+      MONGO_HOST: mongo-inventory
+      MONGO_PORT: 27017
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      EUREKA_SERVER_URL: http://discovery-server:8761/eureka/
+      CONFIG_SERVER_URL: http://config-server:8888
+      GATEWAY_SECRET: dev-gateway-secret
+      OTLP_TRACING_ENDPOINT: http://jaeger:4318/v1/traces
+      LOGGING_FILE_NAME: /logs/inventory-service.log
+    volumes:
+      - "./logs:/logs"

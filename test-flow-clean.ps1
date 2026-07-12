@@ -1,0 +1,394 @@
+$baseUrl = "http://localhost:8080"
+$runId = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+$productId = 1000 + ($runId % 1000000)
+$email = "rahul+$runId@example.com"
+$authUsername = "admin-rahul-auth-$runId"
+$authEmail = "rahul-auth+$runId@example.com"
+$orderIdempotencyKey = "order-$runId"
+
+function Step($message) {
+    Write-Host ""
+    Write-Host "==== $message ====" -ForegroundColor Cyan
+}
+
+function Show-Json($value) {
+    $value | ConvertTo-Json -Depth 10
+}
+
+function Show-ErrorResponse($errorRecord) {
+    if ($null -eq $errorRecord.Exception.Response) {
+        Write-Host $errorRecord.Exception.Message -ForegroundColor Red
+        return
+    }
+
+    $response = $errorRecord.Exception.Response
+    $stream = $response.GetResponseStream()
+    if ($null -eq $stream) {
+        Write-Host $errorRecord.Exception.Message -ForegroundColor Red
+        return
+    }
+
+    $reader = New-Object System.IO.StreamReader($stream)
+    $body = $reader.ReadToEnd()
+    $reader.Close()
+    $stream.Close()
+
+    if ([string]::IsNullOrWhiteSpace($body)) {
+        Write-Host $errorRecord.Exception.Message -ForegroundColor Red
+        return
+    }
+
+    Write-Host $body -ForegroundColor Red
+}
+
+function Get-HttpStatusCode {
+    param(
+        $errorRecord
+    )
+
+    $response = $errorRecord.Exception.Response
+    if ($null -eq $response) {
+        return $null
+    }
+
+    if ($response -is [System.Net.HttpWebResponse]) {
+        return [int]$response.StatusCode
+    }
+
+    try {
+        return [int]$response.StatusCode
+    } catch {
+        return $null
+    }
+}
+
+function Invoke-StepRequest {
+    param(
+        [scriptblock]$Request
+    )
+
+    try {
+        $result = & $Request
+        if ($null -ne $result) {
+            Show-Json $result
+        }
+        return $result
+    } catch {
+        Show-ErrorResponse $_
+        return $null
+    }
+}
+
+function Invoke-StepRequestWithRetry {
+    param(
+        [scriptblock]$Request,
+        [int]$MaxAttempts = 5,
+        [int[]]$RetryStatusCodes = @(502, 503, 504),
+        [int]$InitialDelaySeconds = 1
+    )
+
+    $delaySeconds = [Math]::Max(0, $InitialDelaySeconds)
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        try {
+            $result = & $Request
+            if ($null -ne $result) {
+                Show-Json $result
+            }
+            return $result
+        } catch {
+            $statusCode = Get-HttpStatusCode $_
+            Show-ErrorResponse $_
+
+            if ($attempt -lt $MaxAttempts -and $null -ne $statusCode -and ($RetryStatusCodes -contains $statusCode)) {
+                Write-Host "Transient error ($statusCode). Retrying attempt $($attempt + 1)/$MaxAttempts in $delaySeconds second(s)..." -ForegroundColor Yellow
+                if ($delaySeconds -gt 0) {
+                    Start-Sleep -Seconds $delaySeconds
+                }
+                # Simple backoff: 1s, 2s, 4s, 8s...
+                $delaySeconds = [Math]::Min(10, [Math]::Max(1, $delaySeconds * 2))
+                continue
+            }
+
+            return $null
+        }
+    }
+
+    return $null
+}
+
+function Wait-ForHealthyEndpoint {
+    param(
+        [string]$Name,
+        [string]$Uri,
+        [int]$TimeoutSeconds = 180
+    )
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        try {
+            $response = Invoke-RestMethod -Method Get -Uri $Uri
+            if ($null -ne $response.status -and $response.status -eq "UP") {
+                Write-Host "$Name is healthy." -ForegroundColor Green
+                return
+            }
+        } catch {
+        }
+
+        Start-Sleep -Seconds 2
+    }
+
+    throw "$Name did not become healthy within $TimeoutSeconds seconds."
+}
+
+function Wait-ForGatewayRouting {
+    param(
+        [int]$TimeoutSeconds = 180
+    )
+
+    $probeUri = "$baseUrl/api/inventory/$productId/availability"
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+
+    while ((Get-Date) -lt $deadline) {
+        try {
+            Invoke-RestMethod -Method Get -Uri $probeUri | Out-Null
+            Write-Host "Gateway routing is ready." -ForegroundColor Green
+            return
+        } catch {
+            $statusCode = Get-HttpStatusCode $_
+            if ($statusCode -in 401, 404) {
+                Write-Host "Gateway routing is ready." -ForegroundColor Green
+                return
+            }
+        }
+
+        Start-Sleep -Seconds 2
+    }
+
+    throw "Gateway routing did not become ready within $TimeoutSeconds seconds."
+}
+
+function Wait-ForGatewayBackendReady {
+    param(
+        [string]$Uri,
+        [hashtable]$Headers,
+        [int]$TimeoutSeconds = 180
+    )
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        try {
+            Invoke-RestMethod -Method Get -Uri $Uri -Headers $Headers | Out-Null
+            Write-Host "Gateway backend routing is ready." -ForegroundColor Green
+            return
+        } catch {
+            $statusCode = Get-HttpStatusCode $_
+            if ($statusCode -eq 404) {
+                Write-Host "Gateway backend routing is ready." -ForegroundColor Green
+                return
+            }
+        }
+
+        Start-Sleep -Seconds 2
+    }
+
+    throw "Gateway backend routing did not become ready within $TimeoutSeconds seconds."
+}
+
+function Wait-ForGatewayAuthBackendReady {
+    param(
+        [int]$TimeoutSeconds = 180
+    )
+
+    $probeUri = "$baseUrl/auth/login"
+    $probeBody = @{
+        username = "gateway-readiness-probe"
+        password = "not-a-real-user"
+    } | ConvertTo-Json
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+
+    while ((Get-Date) -lt $deadline) {
+        try {
+            Invoke-RestMethod -Method Post -Uri $probeUri -ContentType "application/json" -Body $probeBody | Out-Null
+            Write-Host "Gateway auth backend routing is ready." -ForegroundColor Green
+            return
+        } catch {
+            $statusCode = Get-HttpStatusCode $_
+            if ($statusCode -in 400, 401) {
+                Write-Host "Gateway auth backend routing is ready." -ForegroundColor Green
+                return
+            }
+        }
+
+        Start-Sleep -Seconds 2
+    }
+
+    throw "Gateway auth backend routing did not become ready within $TimeoutSeconds seconds."
+}
+
+Step "0. Wait for services to be ready"
+Wait-ForHealthyEndpoint -Name "API gateway" -Uri "$baseUrl/actuator/health"
+Wait-ForHealthyEndpoint -Name "Auth service" -Uri "http://localhost:8084/actuator/health"
+Wait-ForHealthyEndpoint -Name "User service" -Uri "http://localhost:8081/actuator/health"
+Wait-ForHealthyEndpoint -Name "Order service" -Uri "http://localhost:8082/actuator/health"
+Wait-ForHealthyEndpoint -Name "Inventory service" -Uri "http://localhost:8083/actuator/health"
+Wait-ForGatewayRouting
+Wait-ForGatewayAuthBackendReady
+
+Step "1. Register and login auth user"
+$registerBody = @{
+    username = $authUsername
+    email = $authEmail
+    password = "Password@123"
+} | ConvertTo-Json
+Invoke-StepRequest { Invoke-RestMethod -Method Post -Uri "$baseUrl/auth/register" -ContentType "application/json" -Body $registerBody }
+$loginBody = @{
+    username = $authUsername
+    password = "Password@123"
+} | ConvertTo-Json
+$auth = Invoke-StepRequest { Invoke-RestMethod -Method Post -Uri "$baseUrl/auth/login" -ContentType "application/json" -Body $loginBody }
+$authHeaders = if ($null -ne $auth) { @{ Authorization = "Bearer $($auth.accessToken)" } } else { $null }
+if ($null -ne $authHeaders) {
+    Wait-ForGatewayBackendReady -Uri "$baseUrl/api/inventory/$productId/availability" -Headers $authHeaders
+}
+
+Step "1b. RBAC check (USER should be forbidden for inventory write)"
+$userUsername = "user-rahul-auth-$runId"
+$userEmail = "rahul-user-auth+$runId@example.com"
+$userRegisterBody = @{
+    username = $userUsername
+    email = $userEmail
+    password = "Password@123"
+} | ConvertTo-Json
+Invoke-StepRequest { Invoke-RestMethod -Method Post -Uri "$baseUrl/auth/register" -ContentType "application/json" -Body $userRegisterBody }
+$userLoginBody = @{
+    username = $userUsername
+    password = "Password@123"
+} | ConvertTo-Json
+$userAuth = Invoke-StepRequest { Invoke-RestMethod -Method Post -Uri "$baseUrl/auth/login" -ContentType "application/json" -Body $userLoginBody }
+$userHeaders = if ($null -ne $userAuth) { @{ Authorization = "Bearer $($userAuth.accessToken)" } } else { $null }
+if ($null -ne $userHeaders) {
+    $userInventoryBody = @{
+        productId = $productId + 1
+        productName = "RBAC should fail Run $runId"
+        availableQuantity = 1
+    } | ConvertTo-Json
+    try {
+        Invoke-RestMethod -Method Post -Uri "$baseUrl/api/inventory" -Headers $userHeaders -ContentType "application/json" -Body $userInventoryBody | Out-Null
+        Write-Host "Unexpected: USER was allowed to write inventory." -ForegroundColor Yellow
+    } catch {
+        $statusCode = Get-HttpStatusCode $_
+        if ($statusCode -eq 403) {
+            Write-Host "RBAC OK: USER received 403 Forbidden for inventory write." -ForegroundColor Green
+        } else {
+            Write-Host "RBAC check returned unexpected status: $statusCode" -ForegroundColor Yellow
+            Show-ErrorResponse $_
+        }
+    }
+}
+
+Step "2. Run metadata"
+Write-Host "runId: $runId"
+Write-Host "productId: $productId"
+Write-Host "email: $email"
+
+Step "3. Create inventory"
+$inventoryBody = @{
+    productId = $productId
+    productName = "iPhone 15 Run $runId"
+    availableQuantity = 10
+} | ConvertTo-Json
+$inventory = Invoke-StepRequestWithRetry -MaxAttempts 5 -InitialDelaySeconds 1 -Request {
+    Invoke-RestMethod -Method Post -Uri "$baseUrl/api/inventory" -Headers $authHeaders -ContentType "application/json" -Body $inventoryBody
+}
+
+Step "4. Check inventory before order"
+$inventoryBefore = Invoke-StepRequest { Invoke-RestMethod -Method Get -Uri "$baseUrl/api/inventory/$productId" -Headers $authHeaders }
+$availabilityBefore = Invoke-StepRequest { Invoke-RestMethod -Method Get -Uri "$baseUrl/api/inventory/$productId/availability" -Headers $authHeaders }
+
+Step "5. Create user"
+$userBody = @{
+    name = "Rahul"
+    email = $email
+    address = "Bangalore"
+} | ConvertTo-Json
+$user = Invoke-StepRequestWithRetry -MaxAttempts 5 -InitialDelaySeconds 1 -Request {
+    Invoke-RestMethod -Method Post -Uri "$baseUrl/api/users" -Headers $authHeaders -ContentType "application/json" -Body $userBody
+}
+$userId = if ($null -ne $user) { $user.id } else { $null }
+
+if ($null -ne $authHeaders) {
+    Wait-ForGatewayBackendReady -Uri "$baseUrl/api/orders/0" -Headers $authHeaders
+}
+
+Step "6. Place order"
+$orderBody = @{
+    userId = $userId
+    productId = $productId
+    quantity = 2
+    unitPrice = 49999.00
+} | ConvertTo-Json
+if ($null -ne $userId) {
+    # On cold start, the gateway may briefly return 503 (timeout/circuit-breaker) even though the backend is coming up.
+    # Retrying makes this flow deterministic for demos.
+    $order = Invoke-StepRequestWithRetry -MaxAttempts 5 -InitialDelaySeconds 1 -Request {
+        $orderHeaders = @{}
+        foreach ($key in $authHeaders.Keys) {
+            $orderHeaders[$key] = $authHeaders[$key]
+        }
+        $orderHeaders["Idempotency-Key"] = $orderIdempotencyKey
+        Invoke-RestMethod -Method Post -Uri "$baseUrl/api/orders" -Headers $orderHeaders -ContentType "application/json" -Body $orderBody
+    }
+    $orderId = if ($null -ne $order) { $order.orderId } else { $null }
+} else {
+    Write-Host "Skipping order creation because user id is unavailable." -ForegroundColor Yellow
+    $orderId = $null
+}
+
+Step "7. Wait for Kafka processing"
+Start-Sleep -Seconds 5
+
+Step "8. Check order after async processing"
+if ($null -ne $orderId) {
+    $finalOrder = Invoke-StepRequest { Invoke-RestMethod -Method Get -Uri "$baseUrl/api/orders/$orderId" -Headers $authHeaders }
+} else {
+    Write-Host "Skipping order fetch because order id is unavailable." -ForegroundColor Yellow
+    $finalOrder = $null
+}
+
+Step "9. Check inventory after order"
+$inventoryAfter = Invoke-StepRequest { Invoke-RestMethod -Method Get -Uri "$baseUrl/api/inventory/$productId" -Headers $authHeaders }
+$availabilityAfter = Invoke-StepRequest { Invoke-RestMethod -Method Get -Uri "$baseUrl/api/inventory/$productId/availability" -Headers $authHeaders }
+
+Step "10. Summary"
+Write-Host "UserId: $userId"
+Write-Host "OrderId: $orderId"
+Write-Host "ProductId: $productId"
+if ($null -ne $finalOrder) {
+    Write-Host "Final order status: $($finalOrder.status)" -ForegroundColor Green
+}
+if ($null -ne $inventoryAfter) {
+    Write-Host "Inventory reserved quantity: $($inventoryAfter.reservedQuantity)" -ForegroundColor Green
+}
+
+Step "11. Rate limiting smoke test (try to trigger 429)"
+$hitUri = "$baseUrl/api/inventory/$productId/availability"
+$hit429 = $false
+for ($i = 0; $i -lt 60; $i++) {
+    try {
+        Invoke-RestMethod -Method Get -Uri $hitUri -Headers $authHeaders | Out-Null
+    } catch {
+        $statusCode = Get-HttpStatusCode $_
+        if ($statusCode -eq 429) {
+            $hit429 = $true
+            break
+        }
+    }
+}
+if ($hit429) {
+    Write-Host "Rate limiting OK: received 429 Too Many Requests." -ForegroundColor Green
+} else {
+    Write-Host "Rate limiting note: did not hit 429 in this run (limits may be high or requests were slow)." -ForegroundColor Yellow
+}
+
+Write-Host ""
+Write-Host "Flow completed." -ForegroundColor Green
