@@ -1,6 +1,5 @@
 <project xmlns="http://maven.apache.org/POM/4.0.0"
-         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
     <modelVersion>4.0.0</modelVersion>
 
     <parent>
@@ -12,79 +11,381 @@
     <artifactId>order-service</artifactId>
     <name>order-service</name>
 
+    <!--
+    ==========================================
+    INTERVIEW NOTES — ORDER SERVICE (pom.xml)
+    ==========================================
+
+    Q: What is the role of the Order Service in a microservices architecture?
+    A: The Order Service is a domain-specific microservice responsible for the full
+       lifecycle of an order — create, update, cancel, and fetch. It owns its own
+       database (MySQL), communicates synchronously via Feign, and publishes/consumes
+       events asynchronously via Kafka. This follows the "Database per Service" pattern.
+
+    Q: Why inherit from a parent POM?
+    A: The parent POM (ecommerce-system-design) centralizes:
+       - Dependency version management (no version duplication in child modules)
+       - Common plugin configuration (spring-boot-maven-plugin)
+       - Shared properties (Java version, Spring Boot/Cloud BOM versions)
+       This follows the DRY principle and prevents version conflicts across services.
+    -->
+
     <dependencies>
+
+        <!--
+        ==========================================
+        1. CORE WEB — spring-boot-starter-web
+        ==========================================
+        Q: What does spring-boot-starter-web provide?
+        A: Bundles Spring MVC, an embedded Tomcat server, Jackson (JSON serialization),
+           and auto-configuration. Enables building RESTful APIs with @RestController.
+
+        Q: Why embedded Tomcat instead of a standalone server?
+        A: Simplifies deployment (fat JAR), aligns with 12-Factor App principles,
+           and is ideal for containerized microservices (Docker/K8s).
+        -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-web</artifactId>
         </dependency>
+
+        <!--
+        ==========================================
+        2. ORM / DATABASE — spring-boot-starter-data-jpa
+        ==========================================
+        Q: What is Spring Data JPA and why use it?
+        A: Provides Hibernate ORM on top of JPA. Enables @Entity mapping and
+           repository pattern (JpaRepository) — eliminates boilerplate CRUD code.
+           Supports JPQL and native queries.
+
+        Q: Database-per-service pattern?
+        A: Each microservice (order, user, payment) has its OWN dedicated MySQL
+           schema. Ensures loose coupling — no shared DB, no cross-service JOINs.
+           Services query each other only via APIs or events.
+        -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-data-jpa</artifactId>
         </dependency>
+
+        <!--
+        ==========================================
+        3. INPUT VALIDATION — spring-boot-starter-validation
+        ==========================================
+        Q: What does this provide?
+        A: Integrates Hibernate Validator (Bean Validation 3.0 / JSR-380).
+           Enables annotations like @NotNull, @NotBlank, @Min, @Max, @Email
+           on DTOs and method parameters with @Valid / @Validated.
+
+        Q: Why validate at the service boundary?
+        A: Prevents invalid data from reaching the business layer or DB.
+           Returns structured 400 Bad Request responses early, reducing load.
+        -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-validation</artifactId>
         </dependency>
+
+        <!--
+        ==========================================
+        4. ASYNC MESSAGING — spring-kafka
+        ==========================================
+        Q: Why Kafka in an Order Service?
+        A: After an order is placed, other services (Notification, Inventory, Payment)
+           need to react. Kafka decouples them — Order Service publishes an
+           "ORDER_PLACED" event; consumers process independently (async).
+
+        Q: Kafka vs REST for inter-service communication?
+        A: | Aspect       | Kafka (Async)        | REST/Feign (Sync)     |
+           |==============|======================|=======================|
+           | Coupling     | Loose                | Tight                 |
+           | Availability | High (event replay)  | Dependent on uptime   |
+           | Use case     | Notifications, audit | Real-time data fetch  |
+
+        Q: What is a Consumer Group in Kafka?
+        A: A group of consumers sharing a topic's partitions. Each message is
+           delivered to exactly one consumer in the group — enables horizontal scaling.
+        -->
         <dependency>
             <groupId>org.springframework.kafka</groupId>
             <artifactId>spring-kafka</artifactId>
         </dependency>
+
+        <!--
+        ==========================================
+        5. SERVICE DISCOVERY — spring-cloud-starter-netflix-eureka-client
+        ==========================================
+        Q: What is Eureka and why is it needed?
+        A: Eureka is a Service Registry (Netflix OSS). Each microservice registers
+           itself on startup with its host/port. Other services discover it by name
+           (e.g., "order-service") instead of hardcoded IPs — enabling dynamic scaling.
+
+        Q: What happens if Eureka goes down?
+        A: Eureka clients cache the registry locally. Services continue to communicate
+           using the cached list (self-preservation mode). For production, Eureka is
+           deployed in a cluster (multiple instances).
+        -->
         <dependency>
             <groupId>org.springframework.cloud</groupId>
             <artifactId>spring-cloud-starter-netflix-eureka-client</artifactId>
         </dependency>
+
+        <!--
+        ==========================================
+        6. HTTP CLIENT — spring-cloud-starter-openfeign
+        ==========================================
+        Q: What is OpenFeign?
+        A: A declarative HTTP client. You define an interface annotated with
+           @FeignClient("service-name") and Spring generates the implementation.
+           Eliminates manual RestTemplate/WebClient boilerplate.
+
+        Q: How does Feign integrate with Eureka?
+        A: When @FeignClient("user-service") is used, Feign asks the LoadBalancer
+           to resolve "user-service" → actual host:port via Eureka registry.
+
+        Q: What is the difference between Feign and RestTemplate?
+        A: Feign is declarative (interface-based, less code), supports Ribbon/LoadBalancer
+           natively, and integrates with Resilience4j for circuit breaking.
+        -->
         <dependency>
             <groupId>org.springframework.cloud</groupId>
             <artifactId>spring-cloud-starter-openfeign</artifactId>
         </dependency>
+
+        <!--
+        ==========================================
+        7. CLIENT-SIDE LOAD BALANCING — spring-cloud-starter-loadbalancer
+        ==========================================
+        Q: What does Spring Cloud LoadBalancer do?
+        A: Replaces Netflix Ribbon (deprecated). Performs client-side load balancing —
+           when multiple instances of a service are registered in Eureka, it picks one
+           using Round Robin (default) or custom strategy.
+
+        Q: Client-side vs Server-side Load Balancing?
+        A: Client-side: the caller (Order Service) picks the target instance.
+           Server-side: a separate LB (e.g., AWS ALB, Nginx) routes traffic.
+           Client-side reduces infrastructure complexity in microservices.
+        -->
         <dependency>
             <groupId>org.springframework.cloud</groupId>
             <artifactId>spring-cloud-starter-loadbalancer</artifactId>
         </dependency>
+
+        <!--
+        ==========================================
+        8. FAULT TOLERANCE — resilience4j-spring-boot3
+        ==========================================
+        Q: What is Resilience4j and what patterns does it support?
+        A: A lightweight fault tolerance library. Key patterns:
+           - Circuit Breaker: Stops calls to a failing service (OPEN/CLOSED/HALF-OPEN states)
+           - Retry: Automatically retries failed calls N times
+           - Rate Limiter: Limits calls per time window
+           - Bulkhead: Limits concurrent calls to prevent thread exhaustion
+           - Time Limiter: Sets a max duration for a call
+
+        Q: What is a Circuit Breaker and why is it important?
+        A: Without it, a slow/down service causes cascading failures (thread pool
+           exhaustion across callers). Circuit Breaker "opens" after a failure threshold,
+           returns a fallback immediately, then "half-opens" to test recovery.
+
+        Q: Why resilience4j over Hystrix?
+        A: Hystrix is in maintenance mode. Resilience4j is lightweight, Java 8+
+           functional, works well with Spring Boot 3, and doesn't need its own thread pool.
+        -->
         <dependency>
             <groupId>io.github.resilience4j</groupId>
             <artifactId>resilience4j-spring-boot3</artifactId>
         </dependency>
+
+        <!--
+        ==========================================
+        9. OBSERVABILITY — spring-boot-starter-actuator
+        ==========================================
+        Q: What does Actuator provide?
+        A: Production-ready endpoints for monitoring:
+           /actuator/health     → liveness & readiness probes (K8s)
+           /actuator/metrics    → JVM, HTTP, custom metrics
+           /actuator/info       → build/git metadata
+           /actuator/env        → environment properties
+
+        Q: Why is /actuator/health critical in microservices?
+        A: Kubernetes uses it for liveness/readiness probes. If health check fails,
+           K8s restarts the pod or removes it from the load balancer.
+        -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-actuator</artifactId>
         </dependency>
+
+        <!--
+        ==========================================
+        10. METRICS — micrometer-registry-prometheus
+        ==========================================
+        Q: What is Micrometer?
+        A: A vendor-neutral metrics facade (like SLF4J for logging). Collects JVM,
+           HTTP, and custom metrics and exports them in Prometheus format.
+
+        Q: How does the Prometheus + Grafana stack work?
+        A: Prometheus scrapes /actuator/prometheus every N seconds → stores time-series
+           data → Grafana queries Prometheus and renders dashboards (latency, error rate,
+           throughput — RED metrics).
+
+        Q: What are RED metrics?
+        A: Rate (requests/sec), Errors (failed requests/sec), Duration (latency).
+           Core SLIs for microservice health monitoring.
+        -->
         <dependency>
             <groupId>io.micrometer</groupId>
             <artifactId>micrometer-registry-prometheus</artifactId>
         </dependency>
+
+        <!--
+        ==========================================
+        11. DISTRIBUTED TRACING — micrometer-tracing-bridge-otel
+        ==========================================
+        Q: What is distributed tracing and why is it needed?
+        A: In microservices, a single user request spans multiple services. Distributed
+           tracing assigns a unique Trace ID and Span IDs to correlate logs across services.
+           Enables end-to-end latency analysis and root cause identification.
+
+        Q: What is the OpenTelemetry bridge here?
+        A: micrometer-tracing-bridge-otel bridges Micrometer's tracing API to the
+           OpenTelemetry SDK — making it vendor-neutral (can export to Jaeger, Zipkin,
+           Tempo, etc.).
+        -->
         <dependency>
             <groupId>io.micrometer</groupId>
             <artifactId>micrometer-tracing-bridge-otel</artifactId>
         </dependency>
+
+        <!--
+        ==========================================
+        12. TRACE EXPORTER — opentelemetry-exporter-otlp
+        ==========================================
+        Q: What does the OTLP exporter do?
+        A: Exports trace spans using the OpenTelemetry Protocol (OTLP) to a collector
+           (e.g., Grafana Tempo, Jaeger, OpenTelemetry Collector). OTLP is the modern
+           standard, replacing Zipkin's B3 format.
+
+        Q: Trace → Span relationship?
+        A: A Trace = one end-to-end request (unique Trace ID).
+           A Span = one unit of work within a trace (e.g., DB call, HTTP call).
+           Spans are nested (parent-child) forming a trace tree.
+        -->
         <dependency>
             <groupId>io.opentelemetry</groupId>
             <artifactId>opentelemetry-exporter-otlp</artifactId>
         </dependency>
+
+        <!--
+        ==========================================
+        13. API DOCUMENTATION — springdoc-openapi-starter-webmvc-ui
+        ==========================================
+        Q: What is SpringDoc OpenAPI?
+        A: Auto-generates OpenAPI 3.0 (Swagger) documentation by scanning
+           @RestController, @RequestMapping, @Schema annotations.
+           Provides Swagger UI at /swagger-ui.html for interactive API testing.
+
+        Q: Why is explicit version defined here?
+        A: springdoc-openapi is a third-party library — not managed by Spring Boot's
+           BOM. So the version must be explicitly declared (2.5.0 supports Boot 3.x).
+
+        Q: OpenAPI 3.0 vs Swagger 2.0?
+        A: OpenAPI 3.0 (successor to Swagger 2.0) supports oneOf/anyOf schemas,
+           multiple servers, improved security schemes, and request/response examples.
+        -->
         <dependency>
             <groupId>org.springdoc</groupId>
             <artifactId>springdoc-openapi-starter-webmvc-ui</artifactId>
             <version>2.5.0</version>
         </dependency>
+
+        <!--
+        ==========================================
+        14. TESTING — spring-boot-starter-test (scope: test)
+        ==========================================
+        Q: What does spring-boot-starter-test include?
+        A: JUnit 5, Mockito, AssertJ, MockMvc (for controller layer testing),
+           @SpringBootTest (integration tests), @DataJpaTest (JPA slice tests).
+
+        Q: What is scope="test"?
+        A: Dependency is only on the test classpath — not included in the production
+           fat JAR. Reduces artifact size and prevents accidental production usage.
+        -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-test</artifactId>
             <scope>test</scope>
         </dependency>
+
+        <!--
+        ==========================================
+        15. DATABASE DRIVER — mysql-connector-j (scope: runtime)
+        ==========================================
+        Q: Why scope="runtime" for the MySQL driver?
+        A: The code only uses JDBC/JPA interfaces (compile-time). The actual MySQL
+           driver implementation is only needed at runtime. This is a best practice
+           for JDBC drivers — keeps compile classpath clean.
+
+        Q: Why MySQL for Order Service?
+        A: Orders have relational structure (Order → OrderItems → Product).
+           ACID transactions are critical (e.g., order placement must be atomic).
+           MySQL provides strong consistency, JOINs, and foreign key constraints.
+        -->
         <dependency>
             <groupId>com.mysql</groupId>
             <artifactId>mysql-connector-j</artifactId>
             <scope>runtime</scope>
         </dependency>
+
+        <!--
+        ==========================================
+        16. BOILERPLATE REDUCTION — lombok (optional: true)
+        ==========================================
+        Q: What does Lombok provide?
+        A: Annotation-based code generation at compile time:
+           @Getter/@Setter, @Builder, @NoArgsConstructor, @AllArgsConstructor,
+           @Data (all of the above), @Slf4j (injects a logger field).
+
+        Q: Why optional="true"?
+        A: Means Lombok is NOT transitively inherited by modules depending on this one.
+           It's a compile-time tool — not needed at runtime or by consumers.
+
+        Q: How does Lombok work under the hood?
+        A: Uses Java Annotation Processing (APT) — plugs into the compiler and
+           generates bytecode before the main compilation step.
+        -->
         <dependency>
             <groupId>org.projectlombok</groupId>
             <artifactId>lombok</artifactId>
             <optional>true</optional>
         </dependency>
+
+        <!--
+        ==========================================
+        17. AOP — spring-boot-starter-aop
+        ==========================================
+        Q: What is AOP (Aspect-Oriented Programming)?
+        A: A programming paradigm to modularize cross-cutting concerns (logging,
+           security, transaction, metrics) separate from business logic.
+           Core concepts: Aspect, Join Point, Advice (Before/After/Around), Pointcut.
+
+        Q: Why AOP in the Order Service?
+        A: Common use cases:
+           - Logging execution time of methods (@Around advice)
+           - Resilience4j uses AOP internally for @CircuitBreaker, @Retry annotations
+           - @Transactional in Spring is implemented via AOP proxy
+           - Custom auditing (who placed the order, when)
+
+        Q: How does Spring AOP work?
+        A: Uses JDK Dynamic Proxies (for interfaces) or CGLIB proxies (for classes)
+           to wrap target objects and intercept method calls at join points.
+        -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-aop</artifactId>
         </dependency>
+
     </dependencies>
 
     <build>
